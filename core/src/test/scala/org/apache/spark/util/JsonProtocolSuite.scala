@@ -85,7 +85,8 @@ class JsonProtocolSuite extends SparkFunSuite {
       // Use custom accum ID for determinism
       val accumUpdates =
         makeTaskMetrics(300L, 400L, 500L, 600L, 700, 800, hasHadoopInput = true, hasOutput = true)
-          .accumulatorUpdates().zipWithIndex.map { case (a, i) => a.copy(id = i) }
+          .accumulators().map(AccumulatorSuite.makeInfo)
+          .zipWithIndex.map { case (a, i) => a.copy(id = i) }
       SparkListenerExecutorMetricsUpdate("exec3", Seq((1L, 2, 3, accumUpdates)))
     }
 
@@ -385,7 +386,7 @@ class JsonProtocolSuite extends SparkFunSuite {
     // "Task Metrics" field, if it exists.
     val tm = makeTaskMetrics(1L, 2L, 3L, 4L, 5, 6, hasHadoopInput = true, hasOutput = true)
     val tmJson = JsonProtocol.taskMetricsToJson(tm)
-    val accumUpdates = tm.accumulatorUpdates()
+    val accumUpdates = tm.accumulators().map(AccumulatorSuite.makeInfo)
     val exception = new SparkException("sentimental")
     val exceptionFailure = new ExceptionFailure(exception, accumUpdates)
     val exceptionFailureJson = JsonProtocol.taskEndReasonToJson(exceptionFailure)
@@ -813,7 +814,7 @@ private[spark] object JsonProtocolSuite extends Assertions {
       hasHadoopInput: Boolean,
       hasOutput: Boolean,
       hasRecords: Boolean = true) = {
-    val t = new TaskMetrics
+    val t = TaskMetrics.empty
     t.setExecutorDeserializeTime(a)
     t.setExecutorRunTime(b)
     t.setResultSize(c)
@@ -1111,6 +1112,14 @@ private[spark] object JsonProtocolSuite extends Assertions {
       |      "Shuffle Write Time": 1500,
       |      "Shuffle Records Written": 12
       |    },
+      |    "Input Metrics" : {
+      |      "Bytes Read" : 0,
+      |      "Records Read" : 0
+      |    },
+      |    "Output Metrics" : {
+      |      "Bytes Written" : 0,
+      |      "Records Written" : 0
+      |    },
       |    "Updated Blocks": [
       |      {
       |        "Block ID": "rdd_0_0",
@@ -1187,6 +1196,14 @@ private[spark] object JsonProtocolSuite extends Assertions {
       |    "Result Serialization Time": 700,
       |    "Memory Bytes Spilled": 800,
       |    "Disk Bytes Spilled": 0,
+      |    "Shuffle Read Metrics" : {
+      |      "Remote Blocks Fetched" : 0,
+      |      "Local Blocks Fetched" : 0,
+      |      "Fetch Wait Time" : 0,
+      |      "Remote Bytes Read" : 0,
+      |      "Local Bytes Read" : 0,
+      |      "Total Records Read" : 0
+      |    },
       |    "Shuffle Write Metrics": {
       |      "Shuffle Bytes Written": 1200,
       |      "Shuffle Write Time": 1500,
@@ -1195,6 +1212,10 @@ private[spark] object JsonProtocolSuite extends Assertions {
       |    "Input Metrics": {
       |      "Bytes Read": 2100,
       |      "Records Read": 21
+      |    },
+      |     "Output Metrics" : {
+      |      "Bytes Written" : 0,
+      |      "Records Written" : 0
       |    },
       |    "Updated Blocks": [
       |      {
@@ -1272,6 +1293,19 @@ private[spark] object JsonProtocolSuite extends Assertions {
       |    "Result Serialization Time": 700,
       |    "Memory Bytes Spilled": 800,
       |    "Disk Bytes Spilled": 0,
+      |    "Shuffle Read Metrics" : {
+      |      "Remote Blocks Fetched" : 0,
+      |      "Local Blocks Fetched" : 0,
+      |      "Fetch Wait Time" : 0,
+      |      "Remote Bytes Read" : 0,
+      |      "Local Bytes Read" : 0,
+      |      "Total Records Read" : 0
+      |    },
+      |    "Shuffle Write Metrics" : {
+      |      "Shuffle Bytes Written" : 0,
+      |      "Shuffle Write Time" : 0,
+      |      "Shuffle Records Written" : 0
+      |    },
       |    "Input Metrics": {
       |      "Bytes Read": 2100,
       |      "Records Read": 21

@@ -29,17 +29,17 @@ import org.apache.spark.sql.catalyst.expressions.JsonTuple
 import org.apache.spark.sql.catalyst.parser.ParseException
 import org.apache.spark.sql.catalyst.plans.PlanTest
 import org.apache.spark.sql.catalyst.plans.logical.{Generate, ScriptTransformation}
-import org.apache.spark.sql.execution.command.{CreateTable, CreateTableLike}
-import org.apache.spark.sql.hive.execution.{HiveNativeCommand, HiveSqlParser}
+import org.apache.spark.sql.execution.command._
+import org.apache.spark.sql.hive.test.TestHive
 
 class HiveDDLCommandSuite extends PlanTest {
-  val parser = HiveSqlParser
+  val parser = TestHive.sessionState.sqlParser
 
   private def extractTableDesc(sql: String): (CatalogTable, Boolean) = {
     parser.parsePlan(sql).collect {
-      case CreateTable(desc, allowExisting) => (desc, allowExisting)
-      case CreateTableAsSelect(desc, _, allowExisting) => (desc, allowExisting)
-      case CreateViewAsSelect(desc, _, allowExisting, _, _) => (desc, allowExisting)
+      case CreateTableCommand(desc, allowExisting) => (desc, allowExisting)
+      case CreateTableAsSelectLogicalPlan(desc, _, allowExisting) => (desc, allowExisting)
+      case CreateViewCommand(desc, _, allowExisting, _, _, _) => (desc, allowExisting)
     }.head
   }
 
@@ -47,7 +47,7 @@ class HiveDDLCommandSuite extends PlanTest {
     val e = intercept[ParseException] {
       parser.parsePlan(sql)
     }
-    assert(e.getMessage.toLowerCase.contains("unsupported"))
+    assert(e.getMessage.toLowerCase.contains("operation not allowed"))
   }
 
   test("Test CTAS #1") {
@@ -70,7 +70,7 @@ class HiveDDLCommandSuite extends PlanTest {
     assert(exists)
     assert(desc.identifier.database == Some("mydb"))
     assert(desc.identifier.table == "page_view")
-    assert(desc.tableType == CatalogTableType.EXTERNAL_TABLE)
+    assert(desc.tableType == CatalogTableType.EXTERNAL)
     assert(desc.storage.locationUri == Some("/user/external/page_view"))
     assert(desc.schema ==
       CatalogColumn("viewtime", "int") ::
@@ -120,7 +120,7 @@ class HiveDDLCommandSuite extends PlanTest {
     assert(exists)
     assert(desc.identifier.database == Some("mydb"))
     assert(desc.identifier.table == "page_view")
-    assert(desc.tableType == CatalogTableType.EXTERNAL_TABLE)
+    assert(desc.tableType == CatalogTableType.EXTERNAL)
     assert(desc.storage.locationUri == Some("/user/external/page_view"))
     assert(desc.schema ==
       CatalogColumn("viewtime", "int") ::
@@ -151,7 +151,7 @@ class HiveDDLCommandSuite extends PlanTest {
     assert(exists == false)
     assert(desc.identifier.database == None)
     assert(desc.identifier.table == "page_view")
-    assert(desc.tableType == CatalogTableType.MANAGED_TABLE)
+    assert(desc.tableType == CatalogTableType.MANAGED)
     assert(desc.storage.locationUri == None)
     assert(desc.schema == Seq.empty[CatalogColumn])
     assert(desc.viewText == None) // TODO will be SQLText
@@ -187,7 +187,7 @@ class HiveDDLCommandSuite extends PlanTest {
     assert(exists == false)
     assert(desc.identifier.database == None)
     assert(desc.identifier.table == "ctas2")
-    assert(desc.tableType == CatalogTableType.MANAGED_TABLE)
+    assert(desc.tableType == CatalogTableType.MANAGED)
     assert(desc.storage.locationUri == None)
     assert(desc.schema == Seq.empty[CatalogColumn])
     assert(desc.viewText == None) // TODO will be SQLText
@@ -254,12 +254,13 @@ class HiveDDLCommandSuite extends PlanTest {
   }
 
   test("use native json_tuple instead of hive's UDTF in LATERAL VIEW") {
-    val plan = parser.parsePlan(
+    val analyzer = TestHive.sparkSession.sessionState.analyzer
+    val plan = analyzer.execute(parser.parsePlan(
       """
         |SELECT *
         |FROM (SELECT '{"f1": "value1", "f2": 12}' json) test
         |LATERAL VIEW json_tuple(json, 'f1', 'f2') jt AS a, b
-      """.stripMargin)
+      """.stripMargin))
 
     assert(plan.children.head.asInstanceOf[Generate].generator.isInstanceOf[JsonTuple])
   }
@@ -318,7 +319,7 @@ class HiveDDLCommandSuite extends PlanTest {
     assert(!allowExisting)
     assert(desc.identifier.database.isEmpty)
     assert(desc.identifier.table == "my_table")
-    assert(desc.tableType == CatalogTableType.MANAGED_TABLE)
+    assert(desc.tableType == CatalogTableType.MANAGED)
     assert(desc.schema == Seq(CatalogColumn("id", "int"), CatalogColumn("name", "string")))
     assert(desc.partitionColumnNames.isEmpty)
     assert(desc.sortColumnNames.isEmpty)
@@ -347,13 +348,14 @@ class HiveDDLCommandSuite extends PlanTest {
   test("create table - temporary") {
     val query = "CREATE TEMPORARY TABLE tab1 (id int, name string)"
     val e = intercept[ParseException] { parser.parsePlan(query) }
-    assert(e.message.contains("registerTempTable"))
+    assert(e.message.contains("CREATE TEMPORARY TABLE is not supported yet"))
   }
 
   test("create table - external") {
-    val query = "CREATE EXTERNAL TABLE tab1 (id int, name string)"
+    val query = "CREATE EXTERNAL TABLE tab1 (id int, name string) LOCATION '/path/to/nowhere'"
     val (desc, _) = extractTableDesc(query)
-    assert(desc.tableType == CatalogTableType.EXTERNAL_TABLE)
+    assert(desc.tableType == CatalogTableType.EXTERNAL)
+    assert(desc.storage.locationUri == Some("/path/to/nowhere"))
   }
 
   test("create table - if not exists") {
@@ -453,12 +455,6 @@ class HiveDDLCommandSuite extends PlanTest {
     assert(e2.getMessage.contains("Operation not allowed"))
   }
 
-  test("create table - location") {
-    val query = "CREATE TABLE my_table (id int, name string) LOCATION '/path/to/mars'"
-    val (desc, _) = extractTableDesc(query)
-    assert(desc.storage.locationUri == Some("/path/to/mars"))
-  }
-
   test("create table - properties") {
     val query = "CREATE TABLE my_table (id int, name string) TBLPROPERTIES ('k1'='v1', 'k2'='v2')"
     val (desc, _) = extractTableDesc(query)
@@ -480,7 +476,7 @@ class HiveDDLCommandSuite extends PlanTest {
     assert(allowExisting)
     assert(desc.identifier.database == Some("dbx"))
     assert(desc.identifier.table == "my_table")
-    assert(desc.tableType == CatalogTableType.EXTERNAL_TABLE)
+    assert(desc.tableType == CatalogTableType.EXTERNAL)
     assert(desc.schema == Seq(
       CatalogColumn("id", "int"),
       CatalogColumn("name", "string"),
@@ -506,7 +502,7 @@ class HiveDDLCommandSuite extends PlanTest {
     assert(!exists)
     assert(desc.identifier.database.isEmpty)
     assert(desc.identifier.table == "view1")
-    assert(desc.tableType == CatalogTableType.VIRTUAL_VIEW)
+    assert(desc.tableType == CatalogTableType.VIEW)
     assert(desc.storage.locationUri.isEmpty)
     assert(desc.schema == Seq.empty[CatalogColumn])
     assert(desc.viewText == Option("SELECT * FROM tab1"))
@@ -521,17 +517,16 @@ class HiveDDLCommandSuite extends PlanTest {
   test("create view - full") {
     val v1 =
       """
-        |CREATE OR REPLACE VIEW IF NOT EXISTS view1
+        |CREATE OR REPLACE VIEW view1
         |(col1, col3)
         |COMMENT 'BLABLA'
         |TBLPROPERTIES('prop1Key'="prop1Val")
         |AS SELECT * FROM tab1
       """.stripMargin
     val (desc, exists) = extractTableDesc(v1)
-    assert(exists)
     assert(desc.identifier.database.isEmpty)
     assert(desc.identifier.table == "view1")
-    assert(desc.tableType == CatalogTableType.VIRTUAL_VIEW)
+    assert(desc.tableType == CatalogTableType.VIEW)
     assert(desc.storage.locationUri.isEmpty)
     assert(desc.schema ==
       CatalogColumn("col1", null, nullable = true, None) ::
@@ -549,7 +544,7 @@ class HiveDDLCommandSuite extends PlanTest {
   test("create view -- partitioned view") {
     val v1 = "CREATE VIEW view1 partitioned on (ds, hr) as select * from srcpart"
     intercept[ParseException] {
-      parser.parsePlan(v1).isInstanceOf[HiveNativeCommand]
+      parser.parsePlan(v1)
     }
   }
 
@@ -560,7 +555,7 @@ class HiveDDLCommandSuite extends PlanTest {
   test("create table like") {
     val v1 = "CREATE TABLE table1 LIKE table2"
     val (target, source, exists) = parser.parsePlan(v1).collect {
-      case CreateTableLike(t, s, allowExisting) => (t, s, allowExisting)
+      case CreateTableLikeCommand(t, s, allowExisting) => (t, s, allowExisting)
     }.head
     assert(exists == false)
     assert(target.database.isEmpty)
@@ -570,13 +565,38 @@ class HiveDDLCommandSuite extends PlanTest {
 
     val v2 = "CREATE TABLE IF NOT EXISTS table1 LIKE table2"
     val (target2, source2, exists2) = parser.parsePlan(v2).collect {
-      case CreateTableLike(t, s, allowExisting) => (t, s, allowExisting)
+      case CreateTableLikeCommand(t, s, allowExisting) => (t, s, allowExisting)
     }.head
     assert(exists2)
     assert(target2.database.isEmpty)
     assert(target2.table == "table1")
     assert(source2.database.isEmpty)
     assert(source2.table == "table2")
+  }
+
+  test("load data") {
+    val v1 = "LOAD DATA INPATH 'path' INTO TABLE table1"
+    val (table, path, isLocal, isOverwrite, partition) = parser.parsePlan(v1).collect {
+      case LoadDataCommand(t, path, l, o, partition) => (t, path, l, o, partition)
+    }.head
+    assert(table.database.isEmpty)
+    assert(table.table == "table1")
+    assert(path == "path")
+    assert(!isLocal)
+    assert(!isOverwrite)
+    assert(partition.isEmpty)
+
+    val v2 = "LOAD DATA LOCAL INPATH 'path' OVERWRITE INTO TABLE table1 PARTITION(c='1', d='2')"
+    val (table2, path2, isLocal2, isOverwrite2, partition2) = parser.parsePlan(v2).collect {
+      case LoadDataCommand(t, path, l, o, partition) => (t, path, l, o, partition)
+    }.head
+    assert(table2.database.isEmpty)
+    assert(table2.table == "table1")
+    assert(path2 == "path")
+    assert(isLocal2)
+    assert(isOverwrite2)
+    assert(partition2.nonEmpty)
+    assert(partition2.get.apply("c") == "1" && partition2.get.apply("d") == "2")
   }
 
 }

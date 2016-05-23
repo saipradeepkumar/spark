@@ -32,14 +32,14 @@ import org.apache.hadoop.hive.common.{HiveInterruptCallback, HiveInterruptUtils}
 import org.apache.hadoop.hive.conf.HiveConf
 import org.apache.hadoop.hive.ql.Driver
 import org.apache.hadoop.hive.ql.exec.Utilities
-import org.apache.hadoop.hive.ql.processors.{AddResourceProcessor, CommandProcessor,
-  CommandProcessorFactory, SetProcessor}
+import org.apache.hadoop.hive.ql.processors.{AddResourceProcessor, CommandProcessor}
+import org.apache.hadoop.hive.ql.processors.{CommandProcessorFactory, ResetProcessor, SetProcessor}
 import org.apache.hadoop.hive.ql.session.SessionState
 import org.apache.thrift.transport.TSocket
 
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.AnalysisException
-import org.apache.spark.sql.hive.HiveContext
+import org.apache.spark.sql.hive.HiveUtils
 import org.apache.spark.util.ShutdownHookManager
 
 /**
@@ -82,7 +82,7 @@ private[hive] object SparkSQLCLIDriver extends Logging {
 
     val cliConf = new HiveConf(classOf[SessionState])
     // Override the location of the metastore since this is only used for local execution.
-    HiveContext.newTemporaryConfiguration(useInMemoryDerby = false).foreach {
+    HiveUtils.newTemporaryConfiguration(useInMemoryDerby = false).foreach {
       case (key, value) => cliConf.set(key, value)
     }
     val sessionState = new CliSessionState(cliConf)
@@ -150,7 +150,7 @@ private[hive] object SparkSQLCLIDriver extends Logging {
     }
 
     if (sessionState.database != null) {
-      SparkSQLEnv.hiveContext.sessionState.catalog.setCurrentDatabase(
+      SparkSQLEnv.sqlContext.sessionState.catalog.setCurrentDatabase(
         s"${sessionState.database}")
     }
 
@@ -312,7 +312,7 @@ private[hive] class SparkSQLCLIDriver extends CliDriver with Logging {
       if (proc != null) {
         // scalastyle:off println
         if (proc.isInstanceOf[Driver] || proc.isInstanceOf[SetProcessor] ||
-          proc.isInstanceOf[AddResourceProcessor]) {
+          proc.isInstanceOf[AddResourceProcessor] || proc.isInstanceOf[ResetProcessor]) {
           val driver = new SparkSQLDriver
 
           driver.init()

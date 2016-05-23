@@ -26,8 +26,8 @@ import org.apache.spark.sql.catalyst.expressions.aggregate._
 import org.apache.spark.sql.catalyst.expressions.codegen._
 import org.apache.spark.sql.catalyst.plans.physical._
 import org.apache.spark.sql.execution._
-import org.apache.spark.sql.execution.metric.SQLMetrics
-import org.apache.spark.sql.types.{LongType, StructType}
+import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
+import org.apache.spark.sql.types.{DecimalType, StringType, StructType}
 import org.apache.spark.unsafe.KVIterator
 
 case class TungstenAggregate(
@@ -38,7 +38,7 @@ case class TungstenAggregate(
     initialInputBufferOffset: Int,
     resultExpressions: Seq[NamedExpression],
     child: SparkPlan)
-  extends UnaryNode with CodegenSupport {
+  extends UnaryExecNode with CodegenSupport {
 
   private[this] val aggregateBufferAttributes = {
     aggregateExpressions.flatMap(_.aggregateFunction.aggBufferAttributes)
@@ -51,9 +51,10 @@ case class TungstenAggregate(
       aggregateExpressions.flatMap(_.aggregateFunction.inputAggBufferAttributes)
 
   override private[sql] lazy val metrics = Map(
-    "numOutputRows" -> SQLMetrics.createLongMetric(sparkContext, "number of output rows"),
-    "dataSize" -> SQLMetrics.createSizeMetric(sparkContext, "data size"),
-    "spillSize" -> SQLMetrics.createSizeMetric(sparkContext, "spill size"))
+    "numOutputRows" -> SQLMetrics.createMetric(sparkContext, "number of output rows"),
+    "peakMemory" -> SQLMetrics.createSizeMetric(sparkContext, "peak memory"),
+    "spillSize" -> SQLMetrics.createSizeMetric(sparkContext, "spill size"),
+    "aggTime" -> SQLMetrics.createTimingMetric(sparkContext, "aggregate time"))
 
   override def output: Seq[Attribute] = resultExpressions.map(_.toAttribute)
 
@@ -83,7 +84,7 @@ case class TungstenAggregate(
 
   protected override def doExecute(): RDD[InternalRow] = attachTree(this, "execute") {
     val numOutputRows = longMetric("numOutputRows")
-    val dataSize = longMetric("dataSize")
+    val peakMemory = longMetric("peakMemory")
     val spillSize = longMetric("spillSize")
 
     child.execute().mapPartitions { iter =>
@@ -107,7 +108,7 @@ case class TungstenAggregate(
             iter,
             testFallbackStartsAt,
             numOutputRows,
-            dataSize,
+            peakMemory,
             spillSize)
         if (!hasInput && groupingExpressions.isEmpty) {
           numOutputRows += 1
@@ -129,8 +130,8 @@ case class TungstenAggregate(
     !aggregateExpressions.exists(_.aggregateFunction.isInstanceOf[ImperativeAggregate])
   }
 
-  override def upstreams(): Seq[RDD[InternalRow]] = {
-    child.asInstanceOf[CodegenSupport].upstreams()
+  override def inputRDDs(): Seq[RDD[InternalRow]] = {
+    child.asInstanceOf[CodegenSupport].inputRDDs()
   }
 
   protected override def doProduce(ctx: CodegenContext): String = {
@@ -165,7 +166,7 @@ case class TungstenAggregate(
       ctx.addMutableState("boolean", isNull, "")
       ctx.addMutableState(ctx.javaType(e.dataType), value, "")
       // The initial expression should not access any column
-      val ev = e.gen(ctx)
+      val ev = e.genCode(ctx)
       val initVars = s"""
          | $isNull = ${ev.isNull};
          | $value = ${ev.value};
@@ -179,13 +180,13 @@ case class TungstenAggregate(
       // evaluate aggregate results
       ctx.currentVars = bufVars
       val aggResults = functions.map(_.evaluateExpression).map { e =>
-        BindReferences.bindReference(e, aggregateBufferAttributes).gen(ctx)
+        BindReferences.bindReference(e, aggregateBufferAttributes).genCode(ctx)
       }
       val evaluateAggResults = evaluateVariables(aggResults)
       // evaluate result expressions
       ctx.currentVars = aggResults
       val resultVars = resultExpressions.map { e =>
-        BindReferences.bindReference(e, aggregateAttributes).gen(ctx)
+        BindReferences.bindReference(e, aggregateAttributes).genCode(ctx)
       }
       (resultVars, s"""
         |$evaluateAggResults
@@ -196,7 +197,7 @@ case class TungstenAggregate(
       (bufVars, "")
     } else {
       // no aggregate function, the result should be literals
-      val resultVars = resultExpressions.map(_.gen(ctx))
+      val resultVars = resultExpressions.map(_.genCode(ctx))
       (resultVars, evaluateVariables(resultVars))
     }
 
@@ -212,10 +213,14 @@ case class TungstenAggregate(
        """.stripMargin)
 
     val numOutput = metricTerm(ctx, "numOutputRows")
+    val aggTime = metricTerm(ctx, "aggTime")
+    val beforeAgg = ctx.freshName("beforeAgg")
     s"""
        | while (!$initAgg) {
        |   $initAgg = true;
+       |   long $beforeAgg = System.nanoTime();
        |   $doAgg();
+       |   $aggTime.add((System.nanoTime() - $beforeAgg) / 1000000);
        |
        |   // output the result
        |   ${genResult.trim}
@@ -239,8 +244,12 @@ case class TungstenAggregate(
       }
     }
     ctx.currentVars = bufVars ++ input
-    // TODO: support subexpression elimination
-    val aggVals = updateExpr.map(BindReferences.bindReference(_, inputAttrs).gen(ctx))
+    val boundUpdateExpr = updateExpr.map(BindReferences.bindReference(_, inputAttrs))
+    val subExprs = ctx.subexpressionEliminationForWholeStageCodegen(boundUpdateExpr)
+    val effectiveCodes = subExprs.codes.mkString("\n")
+    val aggVals = ctx.withSubExprEliminationExprs(subExprs.states) {
+      boundUpdateExpr.map(_.genCode(ctx))
+    }
     // aggregate buffer should be updated atomic
     val updates = aggVals.zipWithIndex.map { case (ev, i) =>
       s"""
@@ -250,6 +259,9 @@ case class TungstenAggregate(
     }
     s"""
        | // do aggregate
+       | // common sub-expressions
+       | $effectiveCodes
+       | // evaluate aggregate function
        | ${evaluateVariables(aggVals)}
        | // update aggregation buffer
        | ${updates.mkString("\n").trim}
@@ -265,11 +277,7 @@ case class TungstenAggregate(
 
   // The name for Vectorized HashMap
   private var vectorizedHashMapTerm: String = _
-
-  // We currently only enable vectorized hashmap for long key/value types and partial aggregates
-  private val isVectorizedHashMapEnabled: Boolean = sqlContext.conf.columnarAggregateMapEnabled &&
-    (groupingKeySchema ++ bufferSchema).forall(_.dataType == LongType) &&
-    modes.forall(mode => mode == Partial || mode == PartialMerge)
+  private var isVectorizedHashMapEnabled: Boolean = _
 
   // The name for UnsafeRow HashMap
   private var hashMapTerm: String = _
@@ -307,15 +315,17 @@ case class TungstenAggregate(
    */
   def finishAggregate(
       hashMap: UnsafeFixedWidthAggregationMap,
-      sorter: UnsafeKVExternalSorter): KVIterator[UnsafeRow, UnsafeRow] = {
+      sorter: UnsafeKVExternalSorter,
+      peakMemory: SQLMetric,
+      spillSize: SQLMetric): KVIterator[UnsafeRow, UnsafeRow] = {
 
     // update peak execution memory
     val mapMemory = hashMap.getPeakMemoryUsedBytes
     val sorterMemory = Option(sorter).map(_.getPeakMemoryUsedBytes).getOrElse(0L)
-    val peakMemory = Math.max(mapMemory, sorterMemory)
+    val maxMemory = Math.max(mapMemory, sorterMemory)
     val metrics = TaskContext.get().taskMetrics()
-    metrics.incPeakExecutionMemory(peakMemory)
-    // TODO: update data size and spill size
+    peakMemory.add(maxMemory)
+    metrics.incPeakExecutionMemory(maxMemory)
 
     if (sorter == null) {
       // not spilled
@@ -335,7 +345,7 @@ case class TungstenAggregate(
       val mergeProjection = newMutableProjection(
         mergeExpr,
         aggregateBufferAttributes ++ declFunctions.flatMap(_.inputAggBufferAttributes),
-        subexpressionEliminationEnabled)()
+        subexpressionEliminationEnabled)
       val joinedRow = new JoinedRow()
 
       var currentKey: UnsafeRow = null
@@ -369,6 +379,7 @@ case class TungstenAggregate(
 
           true
         } else {
+          spillSize.add(sorter.getSpillSize)
           false
         }
       }
@@ -394,25 +405,25 @@ case class TungstenAggregate(
       ctx.currentVars = null
       ctx.INPUT_ROW = keyTerm
       val keyVars = groupingExpressions.zipWithIndex.map { case (e, i) =>
-        BoundReference(i, e.dataType, e.nullable).gen(ctx)
+        BoundReference(i, e.dataType, e.nullable).genCode(ctx)
       }
       val evaluateKeyVars = evaluateVariables(keyVars)
       ctx.INPUT_ROW = bufferTerm
       val bufferVars = aggregateBufferAttributes.zipWithIndex.map { case (e, i) =>
-        BoundReference(i, e.dataType, e.nullable).gen(ctx)
+        BoundReference(i, e.dataType, e.nullable).genCode(ctx)
       }
       val evaluateBufferVars = evaluateVariables(bufferVars)
       // evaluate the aggregation result
       ctx.currentVars = bufferVars
       val aggResults = declFunctions.map(_.evaluateExpression).map { e =>
-        BindReferences.bindReference(e, aggregateBufferAttributes).gen(ctx)
+        BindReferences.bindReference(e, aggregateBufferAttributes).genCode(ctx)
       }
       val evaluateAggResults = evaluateVariables(aggResults)
       // generate the final result
       ctx.currentVars = keyVars ++ aggResults
       val inputAttrs = groupingAttributes ++ aggregateAttributes
       val resultVars = resultExpressions.map { e =>
-        BindReferences.bindReference(e, inputAttrs).gen(ctx)
+        BindReferences.bindReference(e, inputAttrs).genCode(ctx)
       }
       s"""
        $evaluateKeyVars
@@ -437,20 +448,47 @@ case class TungstenAggregate(
       ctx.INPUT_ROW = keyTerm
       ctx.currentVars = null
       val eval = resultExpressions.map{ e =>
-        BindReferences.bindReference(e, groupingAttributes).gen(ctx)
+        BindReferences.bindReference(e, groupingAttributes).genCode(ctx)
       }
       consume(ctx, eval)
     }
   }
 
+  /**
+   * Using the vectorized hash map in TungstenAggregate is currently supported for all primitive
+   * data types during partial aggregation. However, we currently only enable the hash map for a
+   * subset of cases that've been verified to show performance improvements on our benchmarks
+   * subject to an internal conf that sets an upper limit on the maximum length of the aggregate
+   * key/value schema.
+   *
+   * This list of supported use-cases should be expanded over time.
+   */
+  private def enableVectorizedHashMap(ctx: CodegenContext): Boolean = {
+    val schemaLength = (groupingKeySchema ++ bufferSchema).length
+    val isSupported =
+      (groupingKeySchema ++ bufferSchema).forall(f => ctx.isPrimitiveType(f.dataType) ||
+        f.dataType.isInstanceOf[DecimalType] || f.dataType.isInstanceOf[StringType]) &&
+        bufferSchema.nonEmpty && modes.forall(mode => mode == Partial || mode == PartialMerge)
+
+    // We do not support byte array based decimal type for aggregate values as
+    // ColumnVector.putDecimal for high-precision decimals doesn't currently support in-place
+    // updates. Due to this, appending the byte array in the vectorized hash map can turn out to be
+    // quite inefficient and can potentially OOM the executor.
+    val isNotByteArrayDecimalType = bufferSchema.map(_.dataType).filter(_.isInstanceOf[DecimalType])
+      .forall(!DecimalType.isByteArrayDecimalType(_))
+
+    isSupported  && isNotByteArrayDecimalType &&
+      schemaLength <= sqlContext.conf.vectorizedAggregateMapMaxColumns
+  }
+
   private def doProduceWithKeys(ctx: CodegenContext): String = {
     val initAgg = ctx.freshName("initAgg")
     ctx.addMutableState("boolean", initAgg, s"$initAgg = false;")
-
+    isVectorizedHashMapEnabled = enableVectorizedHashMap(ctx)
     vectorizedHashMapTerm = ctx.freshName("vectorizedHashMap")
     val vectorizedHashMapClassName = ctx.freshName("VectorizedHashMap")
-    val vectorizedHashMapGenerator = new VectorizedHashMapGenerator(ctx, vectorizedHashMapClassName,
-      groupingKeySchema, bufferSchema)
+    val vectorizedHashMapGenerator = new VectorizedHashMapGenerator(ctx, aggregateExpressions,
+      vectorizedHashMapClassName, groupingKeySchema, bufferSchema)
     // Create a name for iterator from vectorized HashMap
     val iterTermForVectorizedHashMap = ctx.freshName("vectorizedHashMapIter")
     if (isVectorizedHashMapEnabled) {
@@ -474,6 +512,8 @@ case class TungstenAggregate(
     ctx.addMutableState(classOf[KVIterator[UnsafeRow, UnsafeRow]].getName, iterTerm, "")
 
     val doAgg = ctx.freshName("doAggregateWithKeys")
+    val peakMemory = metricTerm(ctx, "peakMemory")
+    val spillSize = metricTerm(ctx, "spillSize")
     ctx.addNewFunction(doAgg,
       s"""
         ${if (isVectorizedHashMapEnabled) vectorizedHashMapGenerator.generate() else ""}
@@ -484,7 +524,7 @@ case class TungstenAggregate(
           ${if (isVectorizedHashMapEnabled) {
               s"$iterTermForVectorizedHashMap = $vectorizedHashMapTerm.rowIterator();"} else ""}
 
-          $iterTerm = $thisPlan.finishAggregate($hashMapTerm, $sorterTerm);
+          $iterTerm = $thisPlan.finishAggregate($hashMapTerm, $sorterTerm, $peakMemory, $spillSize);
         }
        """)
 
@@ -526,10 +566,14 @@ case class TungstenAggregate(
       } else None
     }
 
+    val aggTime = metricTerm(ctx, "aggTime")
+    val beforeAgg = ctx.freshName("beforeAgg")
     s"""
      if (!$initAgg) {
        $initAgg = true;
+       long $beforeAgg = System.nanoTime();
        $doAgg();
+       $aggTime.add((System.nanoTime() - $beforeAgg) / 1000000);
      }
 
      // output the result
@@ -576,7 +620,7 @@ case class TungstenAggregate(
     // generate hash code for key
     val hashExpr = Murmur3Hash(groupingExpressions, 42)
     ctx.currentVars = input
-    val hashEval = BindReferences.bindReference(hashExpr, child.output).gen(ctx)
+    val hashEval = BindReferences.bindReference(hashExpr, child.output).genCode(ctx)
 
     val inputAttr = aggregateBufferAttributes ++ child.output
     ctx.currentVars = new Array[ExprCode](aggregateBufferAttributes.length) ++ input
@@ -613,13 +657,21 @@ case class TungstenAggregate(
     val updateRowInVectorizedHashMap: Option[String] = {
       if (isVectorizedHashMapEnabled) {
         ctx.INPUT_ROW = vectorizedRowBuffer
-        val vectorizedRowEvals = updateExpr.map(BindReferences.bindReference(_, inputAttr).gen(ctx))
+        val boundUpdateExpr = updateExpr.map(BindReferences.bindReference(_, inputAttr))
+        val subExprs = ctx.subexpressionEliminationForWholeStageCodegen(boundUpdateExpr)
+        val effectiveCodes = subExprs.codes.mkString("\n")
+        val vectorizedRowEvals = ctx.withSubExprEliminationExprs(subExprs.states) {
+          boundUpdateExpr.map(_.genCode(ctx))
+        }
         val updateVectorizedRow = vectorizedRowEvals.zipWithIndex.map { case (ev, i) =>
           val dt = updateExpr(i).dataType
-          ctx.updateColumn(vectorizedRowBuffer, dt, i, ev, updateExpr(i).nullable)
+          ctx.updateColumn(vectorizedRowBuffer, dt, i, ev, updateExpr(i).nullable,
+            isVectorized = true)
         }
         Option(
           s"""
+             |// common sub-expressions
+             |$effectiveCodes
              |// evaluate aggregate function
              |${evaluateVariables(vectorizedRowEvals)}
              |// update vectorized row
@@ -662,13 +714,19 @@ case class TungstenAggregate(
 
     val updateRowInUnsafeRowMap: String = {
       ctx.INPUT_ROW = unsafeRowBuffer
-      val unsafeRowBufferEvals =
-        updateExpr.map(BindReferences.bindReference(_, inputAttr).gen(ctx))
+      val boundUpdateExpr = updateExpr.map(BindReferences.bindReference(_, inputAttr))
+      val subExprs = ctx.subexpressionEliminationForWholeStageCodegen(boundUpdateExpr)
+      val effectiveCodes = subExprs.codes.mkString("\n")
+      val unsafeRowBufferEvals = ctx.withSubExprEliminationExprs(subExprs.states) {
+        boundUpdateExpr.map(_.genCode(ctx))
+      }
       val updateUnsafeRowBuffer = unsafeRowBufferEvals.zipWithIndex.map { case (ev, i) =>
         val dt = updateExpr(i).dataType
         ctx.updateColumn(unsafeRowBuffer, dt, i, ev, updateExpr(i).nullable)
       }
       s"""
+         |// common sub-expressions
+         |$effectiveCodes
          |// evaluate aggregate function
          |${evaluateVariables(unsafeRowBufferEvals)}
          |// update unsafe row buffer
